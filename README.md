@@ -6,9 +6,9 @@
 
 ## 功能
 
-- **ELF 对齐检查**: 解析 .so 文件的 ELF PT_LOAD 段，检查 `p_align` 是否 >= 16384 (16KB)
+- **ELF 对齐检查**: 解析 .so 文件的 ELF PT_LOAD 段，检查 `p_align` 是否 >= 16384 (16KB)，并额外检查 RELRO 结束位置是否满足 16KB 规则
 - **ZIP 对齐检查**: 检查未压缩的 .so 文件在 APK (ZIP) 中的数据偏移是否 16KB 对齐
-- **来源追溯**: 优先从本地 Gradle/Maven 依赖缓存中反推精确的 Maven 坐标（group:artifact:version），如未找到则通过分析 APK 内文件（嵌套归档、META-INF 版本文件、DEX 字符串池、文件路径）推测依赖来源
+- **来源追溯**: 优先从项目本地 `libs`（fileTree 引入）和本地 Gradle/Maven 依赖缓存中反推精确来源；如未找到则通过分析 APK 内文件（嵌套归档、META-INF 版本文件、DEX 字符串池、文件路径）推测依赖来源
 - **多种输出格式**: 支持终端表格输出、详细模式（`--verbose`）和 JSON 格式输出（`--json`）
 - **纯 Python 实现**: 无需安装 Android SDK 或 NDK，无第三方依赖
 
@@ -74,6 +74,7 @@ python3 apk_16kb_checker.py app.apk --no-source-search
 
 来源列说明：
 - **精确 Maven 坐标**（如 `com.facebook.fresco:imagepipeline:2.5.0`）：从本地 Gradle/Maven 缓存中反推，或从 APK 内 META-INF 版本文件精确匹配
+- **本地依赖路径**（如 `本地依赖: xxx.aar (/path/to/module/libs/xxx.aar)`）：从项目本地 `libs` 目录中识别（常见于 `implementation fileTree(...)`）
 - **推测坐标**（如 `com.facebook:imagepipeline (推测)`）：无 Gradle 缓存时，从 DEX 字符串池中的 Java 包名推测的 Maven 坐标
 - **System.loadLibrary 引用**：在 DEX 中发现了 `System.loadLibrary()` 调用，但无法识别具体依赖
 - **未找到**：未能找到相关线索
@@ -108,6 +109,8 @@ python3 apk_16kb_checker.py app.apk --no-source-search
         "is_aligned": false,
         "min_align": 4096,
         "min_align_display": "4KB",
+        "relro_ok": true,
+        "relro_issue": "",
         "load_segments": [
           {"offset": 0, "align": 4096, "align_display": "4KB"}
         ]
@@ -121,7 +124,11 @@ python3 apk_16kb_checker.py app.apk --no-source-search
 
 ## 来源追溯原理
 
-工具综合使用 **本地依赖缓存** 和 **APK 内容分析** 两种方式追溯 .so 的依赖来源：
+工具综合使用 **项目本地 libs**、**本地依赖缓存** 和 **APK 内容分析** 三种方式追溯 .so 的依赖来源：
+
+### 项目本地 libs（最高优先级）
+
+自动检测项目目录中的 `libs` 文件夹（包括模块级 `module/libs`），并解析 `build.gradle/build.gradle.kts` 里的 `fileTree(dir: 'xxx', ...)` 目录配置，识别本地 .aar/.jar 中包含的 .so。
 
 ### Gradle/Maven 缓存（优先）
 
@@ -142,6 +149,8 @@ python3 apk_16kb_checker.py app.apk --no-source-search
 ### ELF 对齐（PT_LOAD alignment）
 
 共享库 (.so) 是 ELF 格式文件，PT_LOAD 段的 `p_align` 字段决定内存对齐方式。16KB 页面大小要求所有 PT_LOAD 段的 `p_align >= 16384 (2^14)`。若为 4096 (2^12)，则仅支持 4KB 页面大小。
+
+此外，还会检查 `PT_GNU_RELRO` 段：若 RELRO 结束地址不是 16KB 对齐，则它必须是所属 LOAD 段的后缀；否则也会判为不合规（对应 APK Analyzer 中的 RELRO 16KB 提示）。
 
 ### ZIP 对齐（zipalign）
 

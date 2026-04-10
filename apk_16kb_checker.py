@@ -7,14 +7,15 @@ APK 16KB Page Size Alignment Checker
 1. ELF 对齐检查：PT_LOAD 段的 p_align 是否 >= 16384 (2**14)
 2. ZIP 对齐检查：未压缩的 .so 文件在 APK (ZIP) 中的偏移是否 16KB 对齐
 
-对于不合规的 .so 文件，优先从本地 Gradle/Maven 依赖缓存中反推精确的 Maven
-坐标，如未找到则通过分析 APK 内文件（嵌套归档、META-INF 版本文件、
-DEX 字符串池、文件路径）推测依赖来源。
+对于不合规的 .so 文件，优先从项目本地 libs（fileTree 引入）与 Gradle/Maven
+依赖缓存中反推来源；如未找到则通过分析 APK 内文件（嵌套归档、META-INF
+版本文件、DEX 字符串池、文件路径）推测依赖来源。
 """
 
 import argparse
 import io
 import os
+import re
 import struct
 import sys
 import zipfile
@@ -27,6 +28,7 @@ from typing import Optional
 
 ELF_MAGIC = b"\x7fELF"
 PT_LOAD = 1
+PT_GNU_RELRO = 0x6474E552
 ALIGN_16KB = 16384  # 2**14
 ALIGN_4KB = 4096    # 2**12
 
@@ -63,6 +65,8 @@ class ElfCheckResult:
     load_segments: list = field(default_factory=list)
     min_align: int = 0
     is_aligned: bool = True
+    relro_ok: bool = True
+    relro_issue: str = ""
     error: str = ""
 
 
@@ -140,14 +144,13 @@ def parse_elf(data: bytes) -> Optional[ElfCheckResult]:
         return result
 
     min_load_align = None
+    relro_segments: list[tuple[int, int, int, int]] = []  # (offset, vaddr, filesz, memsz)
     for i in range(e_phnum):
         ph_offset = e_phoff + i * e_phentsize
         if ph_offset + e_phentsize > len(data):
             break
 
         p_type = struct.unpack(f"{endian}I", data[ph_offset:ph_offset + 4])[0]
-        if p_type != PT_LOAD:
-            continue
 
         if result.is_64bit:
             # 64-bit program header layout:
@@ -172,21 +175,49 @@ def parse_elf(data: bytes) -> Optional[ElfCheckResult]:
             p_flags = struct.unpack(f"{endian}I", data[ph_offset + 24:ph_offset + 28])[0]
             p_align = struct.unpack(f"{endian}I", data[ph_offset + 28:ph_offset + 32])[0]
 
-        seg = LoadSegment(
-            offset=p_offset, vaddr=p_vaddr, paddr=p_paddr,
-            filesz=p_filesz, memsz=p_memsz, flags=p_flags, align=p_align,
-        )
-        result.load_segments.append(seg)
+        if p_type == PT_LOAD:
+            seg = LoadSegment(
+                offset=p_offset, vaddr=p_vaddr, paddr=p_paddr,
+                filesz=p_filesz, memsz=p_memsz, flags=p_flags, align=p_align,
+            )
+            result.load_segments.append(seg)
 
-        if min_load_align is None or p_align < min_load_align:
-            min_load_align = p_align
+            if min_load_align is None or p_align < min_load_align:
+                min_load_align = p_align
+        elif p_type == PT_GNU_RELRO:
+            relro_segments.append((p_offset, p_vaddr, p_filesz, p_memsz))
 
     if min_load_align is None:
         result.error = "没有找到 PT_LOAD 段"
         return result
 
     result.min_align = min_load_align
-    result.is_aligned = min_load_align >= ALIGN_16KB
+
+    # RELRO 规则：若 RELRO 结束地址不是 16KB 对齐，则它必须是所在 LOAD 段的后缀。
+    # 这里的“后缀”按文件区间判断（offset/filesz），以匹配 APK Analyzer 的判定。
+    for relro_offset, relro_vaddr, relro_filesz, relro_memsz in relro_segments:
+        relro_end = relro_vaddr + relro_memsz
+        relro_end_aligned = (relro_end % ALIGN_16KB) == 0
+
+        relro_file_end = relro_offset + relro_filesz
+        relro_is_suffix = False
+
+        for seg in result.load_segments:
+            seg_file_start = seg.offset
+            seg_file_end = seg.offset + seg.filesz
+            if relro_offset >= seg_file_start and relro_file_end <= seg_file_end:
+                relro_is_suffix = relro_file_end == seg_file_end
+                if relro_is_suffix:
+                    break
+
+        if not relro_end_aligned and not relro_is_suffix:
+            result.relro_ok = False
+            result.relro_issue = (
+                f"RELRO end=0x{relro_end:X} 非 16KB 对齐，且不是 LOAD 段后缀"
+            )
+            break
+
+    result.is_aligned = (min_load_align >= ALIGN_16KB) and result.relro_ok
     return result
 
 
@@ -512,12 +543,13 @@ def trace_so_sources(
     综合分析 Gradle/Maven 缓存和 APK 内所有文件，追溯 .so 文件的依赖来源。
 
     分析策略（按优先级）：
-    0. 本地 Gradle/Maven 依赖缓存（精确 Maven 坐标，通过 META-INF 交叉验证版本）
-    1. APK 内嵌套的 .aar/.jar 归档
-    2. META-INF 版本文件 + 关键字匹配
-    3. DEX 包名搜索 + Maven 坐标推测
-    4. APK 文件路径关键字匹配
-    5. 用户指定的外部目录中的 .aar/.jar 文件
+    0. 项目本地 libs 目录（fileTree 引入的 .aar/.jar）
+    1. 本地 Gradle/Maven 依赖缓存（精确 Maven 坐标，通过 META-INF 交叉验证版本）
+    2. APK 内嵌套的 .aar/.jar 归档
+    3. META-INF 版本文件 + 关键字匹配
+    4. DEX 包名搜索 + Maven 坐标推测
+    5. APK 文件路径关键字匹配
+    6. 用户指定的外部目录中的 .aar/.jar 文件
 
     Returns:
         so_name -> [来源描述] 的映射
@@ -526,7 +558,13 @@ def trace_so_sources(
     if not target_so_names:
         return dict(so_to_source)
 
-    # ── 策略 0: 自动检测并扫描 Gradle/Maven 依赖缓存 ──
+    # ── 策略 0: 自动检测并扫描项目本地 libs（fileTree） ──
+    local_lib_dirs = _find_local_lib_dirs(apk_path)
+    if local_lib_dirs:
+        print(f"  检测到项目本地 libs: {', '.join(local_lib_dirs)}", file=sys.stderr)
+        _scan_external_dirs(local_lib_dirs, target_so_names, so_to_source)
+
+    # ── 策略 1: 自动检测并扫描 Gradle/Maven 依赖缓存 ──
     auto_caches = _find_dependency_caches()
     gradle_raw: dict[str, list[str]] = defaultdict(list)
     if auto_caches:
@@ -546,14 +584,14 @@ def trace_so_sources(
                     filtered = _filter_gradle_versions(coords, version_map)
                     so_to_source[so_name].extend(filtered)
 
-            # ── 以下策略仅对 Gradle 未找到的 .so 执行 ──
+            # ── 以下策略仅对本地 libs / Gradle 未找到的 .so 执行 ──
             apk_targets = {
                 name for name in target_so_names
                 if not so_to_source.get(name)
             }
 
             if apk_targets:
-                # 策略 1: 扫描嵌套归档（.aar/.jar）
+                # 策略 2: 扫描嵌套归档（.aar/.jar）
                 for name in all_entries:
                     lower = name.lower()
                     if not (lower.endswith(".aar") or lower.endswith(".jar")):
@@ -569,14 +607,14 @@ def trace_so_sources(
                     except (zipfile.BadZipFile, OSError):
                         continue
 
-                # 策略 2: META-INF 版本文件关键字匹配
+                # 策略 3: META-INF 版本文件关键字匹配
                 for so_name in apk_targets:
                     for kw in _so_keywords(so_name):
                         if kw in version_map:
                             so_to_source[so_name].append(version_map[kw])
                             break
 
-                # 策略 3: DEX 包名搜索
+                # 策略 4: DEX 包名搜索
                 unresolved = {
                     name for name in apk_targets
                     if not so_to_source.get(name)
@@ -593,7 +631,7 @@ def trace_so_sources(
                                 )
                                 so_to_source[so_name].append(coord)
 
-                # 策略 4: APK 文件路径匹配
+                # 策略 5: APK 文件路径匹配
                 still_unresolved = {
                     name for name in apk_targets
                     if not so_to_source.get(name)
@@ -611,7 +649,7 @@ def trace_so_sources(
             for so_name, coords in gradle_raw.items():
                 so_to_source[so_name].extend(coords)
 
-    # ── 策略 5: 用户指定的外部目录 ──
+    # ── 策略 6: 用户指定的外部目录 ──
     if search_dirs:
         still_unresolved = {
             name for name in target_so_names
@@ -684,7 +722,96 @@ def _format_archive_path(fpath: str) -> str:
     except ValueError:
         pass
 
-    return fpath
+    base = os.path.basename(fpath)
+    return f"本地依赖: {base} ({fpath})"
+
+
+def _find_local_lib_dirs(apk_path: str) -> list[str]:
+    """
+    自动发现项目中的本地 libs 目录（用于 fileTree 引入的 .aar/.jar）。
+    """
+    found: set[str] = set()
+
+    def _extract_filetree_dirs(gradle_file: str) -> list[str]:
+        try:
+            text = open(gradle_file, "r", encoding="utf-8", errors="replace").read()
+        except OSError:
+            return []
+
+        dirs: list[str] = []
+        patterns = [
+            # Groovy: fileTree(dir: 'libs', ...)
+            r"fileTree\s*\(\s*dir\s*[:=]\s*['\"]([^'\"]+)['\"]",
+            # KTS/Groovy map: fileTree(mapOf("dir" to "libs", ...))
+            r"['\"]dir['\"]\s*(?:to|:)\s*['\"]([^'\"]+)['\"]",
+            # fileTree('libs')
+            r"fileTree\s*\(\s*['\"]([^'\"]+)['\"]\s*\)",
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, text):
+                d = m.group(1).strip()
+                if d:
+                    dirs.append(d)
+        return dirs
+
+    def _add_gradle_declared_dirs(module_dir: str) -> None:
+        gradle_files = [
+            os.path.join(module_dir, "build.gradle"),
+            os.path.join(module_dir, "build.gradle.kts"),
+        ]
+        for gf in gradle_files:
+            if not os.path.isfile(gf):
+                continue
+            for d in _extract_filetree_dirs(gf):
+                cand = os.path.realpath(os.path.join(module_dir, d))
+                if os.path.isdir(cand):
+                    found.add(cand)
+
+    def _collect_from_base(base: str) -> None:
+        libs_dir = os.path.join(base, "libs")
+        if os.path.isdir(libs_dir):
+            found.add(os.path.realpath(libs_dir))
+
+        _add_gradle_declared_dirs(base)
+
+        try:
+            children = os.listdir(base)
+        except OSError:
+            return
+
+        for child in children:
+            child_path = os.path.join(base, child)
+            if not os.path.isdir(child_path):
+                continue
+            has_gradle = (
+                os.path.isfile(os.path.join(child_path, "build.gradle"))
+                or os.path.isfile(os.path.join(child_path, "build.gradle.kts"))
+            )
+            child_libs = os.path.join(child_path, "libs")
+            if has_gradle and os.path.isdir(child_libs):
+                found.add(os.path.realpath(child_libs))
+            if has_gradle:
+                _add_gradle_declared_dirs(child_path)
+
+    # 1) 当前工作目录及其父目录
+    cur = os.path.abspath(os.getcwd())
+    for _ in range(8):
+        _collect_from_base(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    # 2) APK 所在路径向上回溯（适配 app/build/outputs/...）
+    cur = os.path.abspath(os.path.dirname(apk_path))
+    for _ in range(12):
+        _collect_from_base(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    return sorted(found)
 
 
 def _find_dependency_caches() -> list[str]:
@@ -799,7 +926,7 @@ def check_apk(
 
     # 为不合规的 .so 文件查找来源
     if non_compliant_so_names and not no_source_search:
-        print("正在分析 .so 来源（Gradle 缓存 + APK 内容）...", file=sys.stderr)
+        print("正在分析 .so 来源（项目 libs + Gradle 缓存 + APK 内容）...", file=sys.stderr)
 
         source_index = trace_so_sources(
             apk_path, non_compliant_so_names, search_dirs
@@ -835,6 +962,8 @@ def align_str(align_value: int) -> str:
 
 def _shorten_source(source: str) -> str:
     """缩短来源显示，保留 Maven 坐标和推测标记"""
+    if source.startswith("本地依赖:"):
+        return source
     # 保留 "(推测)" 标记
     if source.endswith("(推测)"):
         return source
@@ -856,7 +985,7 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
     non_compliant = total - compliant
     apk_size = os.path.getsize(apk_path) / 1024 / 1024
 
-    W = 120
+    W = 128
     print()
     print("=" * W)
     print(f" APK 16KB 页面大小对齐检查报告")
@@ -876,7 +1005,7 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
     col_no  = 4
     col_so  = 34
     col_abi = 13
-    col_elf = 8
+    col_elf = 16
     col_zip = 11
     col_aar = 45
     fmt = (f" {{:<{col_no}}} {{:<{col_so}}} {{:<{col_abi}}}"
@@ -888,7 +1017,11 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
     print(sep)
 
     for i, r in enumerate(non_compliant_results, 1):
-        elf_align = align_str(r.elf_result.min_align) if r.elf_result else "-"
+        elf_align = "-"
+        if r.elf_result:
+            elf_align = align_str(r.elf_result.min_align)
+            if r.elf_result.min_align >= ALIGN_16KB and not r.elf_result.relro_ok:
+                elf_align = f"{elf_align}/RELRO异常"
 
         if r.zip_result:
             zip_str = "已压缩" if r.zip_result.is_compressed else ("已对齐" if r.zip_result.is_aligned else "未对齐")
@@ -911,6 +1044,8 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
                     tag = "  OK" if seg.align >= ALIGN_16KB else "  !!"
                     print(f"      LOAD[{j}]  offset=0x{seg.offset:08X}  vaddr=0x{seg.vaddr:08X}"
                           f"  filesz=0x{seg.filesz:08X}  align={align_str(seg.align)} (0x{seg.align:X}){tag}")
+            if r.elf_result and not r.elf_result.relro_ok:
+                print(f"      RELRO: {r.elf_result.relro_issue}  !!")
 
     print(f"\n {'─' * (W - 2)}")
     print(f" 结论: {non_compliant}/{total} 个共享库需要使用 16KB 对齐方式重新编译。")
@@ -935,6 +1070,8 @@ def results_to_dict(results: list[SoCheckResult], apk_path: str) -> dict:
                 "is_aligned": r.elf_result.is_aligned,
                 "min_align": r.elf_result.min_align,
                 "min_align_display": align_str(r.elf_result.min_align),
+                "relro_ok": r.elf_result.relro_ok,
+                "relro_issue": r.elf_result.relro_issue,
                 "load_segments": [
                     {
                         "offset": s.offset,
