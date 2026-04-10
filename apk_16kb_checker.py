@@ -15,7 +15,6 @@ APK 16KB Page Size Alignment Checker
 import argparse
 import io
 import os
-import re
 import struct
 import sys
 import zipfile
@@ -543,13 +542,12 @@ def trace_so_sources(
     综合分析 Gradle/Maven 缓存和 APK 内所有文件，追溯 .so 文件的依赖来源。
 
     分析策略（按优先级）：
-    0. 项目本地 libs 目录（fileTree 引入的 .aar/.jar）
+    0. 用户指定的外部目录中的 .aar/.jar 文件
     1. 本地 Gradle/Maven 依赖缓存（精确 Maven 坐标，通过 META-INF 交叉验证版本）
     2. APK 内嵌套的 .aar/.jar 归档
     3. META-INF 版本文件 + 关键字匹配
     4. DEX 包名搜索 + Maven 坐标推测
     5. APK 文件路径关键字匹配
-    6. 用户指定的外部目录中的 .aar/.jar 文件
 
     Returns:
         so_name -> [来源描述] 的映射
@@ -558,18 +556,22 @@ def trace_so_sources(
     if not target_so_names:
         return dict(so_to_source)
 
-    # ── 策略 0: 自动检测并扫描项目本地 libs（fileTree） ──
-    local_lib_dirs = _find_local_lib_dirs(apk_path)
-    if local_lib_dirs:
-        print(f"  检测到项目本地 libs: {', '.join(local_lib_dirs)}", file=sys.stderr)
-        _scan_external_dirs(local_lib_dirs, target_so_names, so_to_source)
+    # ── 策略 0: 用户指定目录（最高优先级） ──
+    if search_dirs:
+        print(f"  使用用户提供目录: {', '.join(search_dirs)}", file=sys.stderr)
+        _scan_external_dirs(search_dirs, target_so_names, so_to_source)
+
+    unresolved_after_user_dirs = {
+        name for name in target_so_names
+        if not so_to_source.get(name)
+    }
 
     # ── 策略 1: 自动检测并扫描 Gradle/Maven 依赖缓存 ──
     auto_caches = _find_dependency_caches()
     gradle_raw: dict[str, list[str]] = defaultdict(list)
-    if auto_caches:
+    if auto_caches and unresolved_after_user_dirs:
         print(f"  检测到本地依赖缓存: {', '.join(auto_caches)}", file=sys.stderr)
-        _scan_external_dirs(auto_caches, target_so_names, gradle_raw)
+        _scan_external_dirs(auto_caches, unresolved_after_user_dirs, gradle_raw)
 
     try:
         with zipfile.ZipFile(apk_path, "r") as zf:
@@ -581,10 +583,11 @@ def trace_so_sources(
             # 交叉验证: Gradle 结果 + META-INF 筛选正确版本
             if gradle_raw:
                 for so_name, coords in gradle_raw.items():
-                    filtered = _filter_gradle_versions(coords, version_map)
-                    so_to_source[so_name].extend(filtered)
+                    if not so_to_source.get(so_name):
+                        filtered = _filter_gradle_versions(coords, version_map)
+                        so_to_source[so_name].extend(filtered)
 
-            # ── 以下策略仅对本地 libs / Gradle 未找到的 .so 执行 ──
+            # ── 以下策略仅对用户目录/Gradle 未找到的 .so 执行 ──
             apk_targets = {
                 name for name in target_so_names
                 if not so_to_source.get(name)
@@ -644,19 +647,11 @@ def trace_so_sources(
                                 so_to_source[so_name].append(f"APK 路径: {e}")
 
     except (zipfile.BadZipFile, OSError):
-        # APK 无法打开时，仍使用 Gradle 原始结果
-        if gradle_raw and not so_to_source:
+        # APK 无法打开时，仍使用 Gradle 原始结果（仅填充尚未命中的项）
+        if gradle_raw:
             for so_name, coords in gradle_raw.items():
-                so_to_source[so_name].extend(coords)
-
-    # ── 策略 6: 用户指定的外部目录 ──
-    if search_dirs:
-        still_unresolved = {
-            name for name in target_so_names
-            if not so_to_source.get(name)
-        }
-        if still_unresolved:
-            _scan_external_dirs(search_dirs, still_unresolved, so_to_source)
+                if not so_to_source.get(so_name):
+                    so_to_source[so_name].extend(coords)
 
     return dict(so_to_source)
 
@@ -724,94 +719,6 @@ def _format_archive_path(fpath: str) -> str:
 
     base = os.path.basename(fpath)
     return f"本地依赖: {base} ({fpath})"
-
-
-def _find_local_lib_dirs(apk_path: str) -> list[str]:
-    """
-    自动发现项目中的本地 libs 目录（用于 fileTree 引入的 .aar/.jar）。
-    """
-    found: set[str] = set()
-
-    def _extract_filetree_dirs(gradle_file: str) -> list[str]:
-        try:
-            text = open(gradle_file, "r", encoding="utf-8", errors="replace").read()
-        except OSError:
-            return []
-
-        dirs: list[str] = []
-        patterns = [
-            # Groovy: fileTree(dir: 'libs', ...)
-            r"fileTree\s*\(\s*dir\s*[:=]\s*['\"]([^'\"]+)['\"]",
-            # KTS/Groovy map: fileTree(mapOf("dir" to "libs", ...))
-            r"['\"]dir['\"]\s*(?:to|:)\s*['\"]([^'\"]+)['\"]",
-            # fileTree('libs')
-            r"fileTree\s*\(\s*['\"]([^'\"]+)['\"]\s*\)",
-        ]
-        for pat in patterns:
-            for m in re.finditer(pat, text):
-                d = m.group(1).strip()
-                if d:
-                    dirs.append(d)
-        return dirs
-
-    def _add_gradle_declared_dirs(module_dir: str) -> None:
-        gradle_files = [
-            os.path.join(module_dir, "build.gradle"),
-            os.path.join(module_dir, "build.gradle.kts"),
-        ]
-        for gf in gradle_files:
-            if not os.path.isfile(gf):
-                continue
-            for d in _extract_filetree_dirs(gf):
-                cand = os.path.realpath(os.path.join(module_dir, d))
-                if os.path.isdir(cand):
-                    found.add(cand)
-
-    def _collect_from_base(base: str) -> None:
-        libs_dir = os.path.join(base, "libs")
-        if os.path.isdir(libs_dir):
-            found.add(os.path.realpath(libs_dir))
-
-        _add_gradle_declared_dirs(base)
-
-        try:
-            children = os.listdir(base)
-        except OSError:
-            return
-
-        for child in children:
-            child_path = os.path.join(base, child)
-            if not os.path.isdir(child_path):
-                continue
-            has_gradle = (
-                os.path.isfile(os.path.join(child_path, "build.gradle"))
-                or os.path.isfile(os.path.join(child_path, "build.gradle.kts"))
-            )
-            child_libs = os.path.join(child_path, "libs")
-            if has_gradle and os.path.isdir(child_libs):
-                found.add(os.path.realpath(child_libs))
-            if has_gradle:
-                _add_gradle_declared_dirs(child_path)
-
-    # 1) 当前工作目录及其父目录
-    cur = os.path.abspath(os.getcwd())
-    for _ in range(8):
-        _collect_from_base(cur)
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
-
-    # 2) APK 所在路径向上回溯（适配 app/build/outputs/...）
-    cur = os.path.abspath(os.path.dirname(apk_path))
-    for _ in range(12):
-        _collect_from_base(cur)
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
-
-    return sorted(found)
 
 
 def _find_dependency_caches() -> list[str]:
@@ -926,7 +833,7 @@ def check_apk(
 
     # 为不合规的 .so 文件查找来源
     if non_compliant_so_names and not no_source_search:
-        print("正在分析 .so 来源（项目 libs + Gradle 缓存 + APK 内容）...", file=sys.stderr)
+        print("正在分析 .so 来源（用户目录 + Gradle 缓存 + APK 内容）...", file=sys.stderr)
 
         source_index = trace_so_sources(
             apk_path, non_compliant_so_names, search_dirs
@@ -1152,10 +1059,21 @@ def main():
     # 去除可能的引号
     apk_path = apk_path.strip('"').strip("'")
 
+    search_dirs = args.search_dirs if args.search_dirs else []
+    if not args.no_source_search and not search_dirs and sys.stdin.isatty():
+        raw = input(
+            "可选：请输入本地 libs/.aar/.jar 目录（多个用逗号分隔，留空跳过）: "
+        ).strip()
+        if raw:
+            for part in raw.split(","):
+                p = part.strip().strip('"').strip("'")
+                if p:
+                    search_dirs.append(os.path.expanduser(p))
+
     results = check_apk(
         apk_path=apk_path,
         check_all_abis=args.all_abis,
-        search_dirs=args.search_dirs if args.search_dirs else None,
+        search_dirs=search_dirs if search_dirs else None,
         no_source_search=args.no_source_search,
     )
 
