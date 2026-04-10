@@ -7,19 +7,18 @@ APK 16KB Page Size Alignment Checker
 1. ELF 对齐检查：PT_LOAD 段的 p_align 是否 >= 16384 (2**14)
 2. ZIP 对齐检查：未压缩的 .so 文件在 APK (ZIP) 中的偏移是否 16KB 对齐
 
-对于不合规的 .so 文件，自动在 Gradle 缓存和指定目录中查找对应的 AAR 来源。
+对于不合规的 .so 文件，通过遍历 APK 内的所有嵌套归档（.aar/.jar）以及
+用户指定的外部目录来追溯 .so 的依赖来源。
 """
 
 import argparse
-import glob
+import io
 import os
 import struct
 import sys
-import tempfile
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
 
@@ -225,115 +224,344 @@ def check_zip_alignment(apk_path: str, entry_name: str) -> Optional[ZipAlignResu
         return None
 
 
-# ──────────────────── AAR 搜索 ────────────────────
+# ──────────────────── SO 来源搜索 ────────────────────
 
-def build_aar_so_index(search_dirs: list[str]) -> dict[str, list[str]]:
-    """
-    在指定目录中搜索所有 AAR 文件，建立 so_name -> [aar_path] 的索引。
-    AAR 文件中的 .so 位于 jni/<abi>/<name>.so
-    """
-    so_to_aar: dict[str, list[str]] = defaultdict(list)
-    seen_aars = set()
 
+def _so_keywords(so_name: str) -> list[str]:
+    """
+    从 so 文件名中提取搜索关键字列表。
+    例: libnative-imagetranscoder.so -> ["native-imagetranscoder", "nativeimagetranscoder",
+                                          "imagetranscoder"]
+    """
+    base = so_name
+    if base.startswith("lib"):
+        base = base[3:]
+    if base.endswith(".so"):
+        base = base[:-3]
+    base = base.lower()
+    if not base:
+        return []
+
+    keywords = [base]
+    # 去掉连字符的版本
+    no_dash = base.replace("-", "")
+    if no_dash != base:
+        keywords.append(no_dash)
+    # 按连字符拆分的子关键字（仅取长度 >= 7 的，避免通用词误匹配）
+    if "-" in base:
+        for part in base.split("-"):
+            if len(part) >= 7 and part not in keywords:
+                keywords.append(part)
+    return keywords
+
+
+def _scan_version_files(zf: zipfile.ZipFile) -> dict[str, str]:
+    """
+    读取 APK 中 META-INF/<group>_<artifact>.version 文件，
+    返回 artifact_keyword -> group:artifact:version 的映射。
+    """
+    versions: dict[str, str] = {}
+    for name in zf.namelist():
+        if not (name.startswith("META-INF/") and name.endswith(".version")):
+            continue
+        base = name[len("META-INF/"):-len(".version")]
+        if "_" not in base:
+            continue
+        try:
+            ver = zf.read(name).decode("utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        group, artifact = base.split("_", 1)
+        coord = f"{group}:{artifact}:{ver}"
+        # 存储多种形式的关键字以便后续匹配
+        art_lower = artifact.lower()
+        versions[art_lower] = coord
+        versions[art_lower.replace("-", "")] = coord
+    return versions
+
+
+def _scan_dex_for_so(zf: zipfile.ZipFile, so_names: set[str]) -> dict[str, list[str]]:
+    """
+    在 DEX 文件中搜索 .so 文件的引用，包括：
+    1. Java 类描述符中包含的包名 (Lcom/xxx/yyy;)
+    2. System.loadLibrary("xxx") 中的库名字符串
+
+    返回 so_name -> [匹配信息] 的映射。
+    """
+    result: dict[str, list[str]] = defaultdict(list)
+    if not so_names:
+        return dict(result)
+
+    # 构建搜索映射: keyword_bytes -> (so_name, keyword_str)
+    search_map: dict[bytes, tuple[str, str]] = {}
+    for so_name in so_names:
+        for kw in _so_keywords(so_name):
+            kw_bytes = kw.encode("utf-8")
+            search_map[kw_bytes] = (so_name, kw)
+
+    dex_entries = [n for n in zf.namelist() if n.endswith(".dex")]
+
+    # 合法类路径字符集
+    valid_class_chars = set(
+        b"abcdefghijklmnopqrstuvwxyz"
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        b"0123456789/$_"
+    )
+
+    for dex_name in dex_entries:
+        try:
+            dex_data = zf.read(dex_name)
+        except OSError:
+            continue
+
+        found_packages: dict[str, set[str]] = defaultdict(set)
+        found_plain: dict[str, bool] = {}
+
+        for kw_bytes, (so_name, kw) in search_map.items():
+            if so_name in result:
+                continue
+
+            pos = 0
+            while True:
+                pos = dex_data.find(kw_bytes, pos)
+                if pos == -1:
+                    break
+
+                # 检查是否为 Java 类描述符 (Lcom/xxx/yyy;)
+                start = pos
+                is_class_desc = False
+                while start > 0:
+                    byte = dex_data[start - 1]
+                    if byte == ord("L"):
+                        start -= 1
+                        is_class_desc = True
+                        break
+                    if byte == ord("/") or byte in valid_class_chars:
+                        start -= 1
+                        continue
+                    break
+
+                if is_class_desc:
+                    end = dex_data.find(b";", pos)
+                    if end != -1 and (end - start) < 200:
+                        fragment = dex_data[start:end].decode("utf-8", errors="replace")
+                        # 验证: 必须以 L 开头, 包含 /, 且路径合理
+                        if (fragment.startswith("L") and "/" in fragment
+                                and ".." not in fragment):
+                            class_path = fragment[1:]
+                            parts = class_path.split("/")
+                            if len(parts) >= 2:
+                                pkg = ".".join(parts[:min(3, len(parts))])
+                                found_packages[so_name].add(pkg)
+                else:
+                    # 可能是 loadLibrary 字符串引用
+                    # DEX 字符串格式: ULEB128_len + MUTF-8_data + \x00
+                    # 验证前后是否为字符串边界
+                    if pos > 0 and dex_data[pos - 1:pos] in (
+                        bytes([len(kw)]),  # 单字节长度
+                        b"\x00",
+                    ):
+                        end = pos + len(kw_bytes)
+                        if end < len(dex_data) and dex_data[end] in (0, ord(".")):
+                            found_plain[so_name] = True
+
+                pos += len(kw_bytes)
+
+        # 整理结果
+        for so_name, packages in found_packages.items():
+            if so_name not in result:
+                filtered = sorted(packages, key=len, reverse=True)
+                for pkg in filtered[:2]:
+                    result[so_name].append(pkg)
+
+        # 对于没有找到类描述符但找到了 loadLibrary 引用的
+        for so_name in found_plain:
+            if so_name not in result:
+                result[so_name].append("System.loadLibrary 引用")
+
+    return dict(result)
+
+
+def _scan_apk_entries(
+    all_entries: list[str], so_names: set[str]
+) -> dict[str, list[str]]:
+    """
+    在 APK 的所有文件路径中搜索与 .so 相关的条目。
+    跳过 lib/ 下的 .so 文件本身。
+
+    检查对象包括: 资源文件、.properties 文件、assets 等。
+    返回 so_name -> [匹配路径] 的映射。
+    """
+    result: dict[str, list[str]] = defaultdict(list)
+
+    # 构建关键字映射
+    kw_map: dict[str, str] = {}  # keyword -> so_name
+    for so_name in so_names:
+        for kw in _so_keywords(so_name):
+            if len(kw) >= 4:  # 避免过短的关键字导致误匹配
+                kw_map[kw] = so_name
+
+    for entry in all_entries:
+        if entry.startswith("lib/") and entry.endswith(".so"):
+            continue
+        entry_lower = entry.lower()
+        for kw, so_name in kw_map.items():
+            if kw in entry_lower:
+                result[so_name].append(entry)
+                break  # 每个条目只匹配一次
+
+    return dict(result)
+
+
+def trace_so_sources(
+    apk_path: str,
+    target_so_names: set[str],
+    search_dirs: Optional[list[str]] = None,
+) -> dict[str, list[str]]:
+    """
+    综合分析 APK 内所有文件，追溯 .so 文件的依赖来源。
+
+    分析策略（按优先级）：
+    1. APK 内嵌套的 .aar/.jar 归档
+    2. META-INF 版本文件 + DEX 包名联合匹配
+    3. APK 文件路径关键字匹配
+    4. 用户指定的外部目录中的 .aar/.jar 文件
+
+    Returns:
+        so_name -> [来源描述] 的映射
+    """
+    so_to_source: dict[str, list[str]] = defaultdict(list)
+    if not target_so_names:
+        return dict(so_to_source)
+
+    try:
+        with zipfile.ZipFile(apk_path, "r") as zf:
+            all_entries = zf.namelist()
+
+            # 策略 1: 扫描嵌套归档（.aar/.jar）
+            for name in all_entries:
+                lower = name.lower()
+                if not (lower.endswith(".aar") or lower.endswith(".jar")):
+                    continue
+                try:
+                    archive_data = zf.read(name)
+                    with zipfile.ZipFile(io.BytesIO(archive_data), "r") as inner_zf:
+                        for inner_name in inner_zf.namelist():
+                            if inner_name.endswith(".so"):
+                                so_name = os.path.basename(inner_name)
+                                if so_name in target_so_names:
+                                    so_to_source[so_name].append(f"APK!{name}")
+                except (zipfile.BadZipFile, OSError):
+                    continue
+
+            # 策略 2: META-INF 版本文件匹配
+            version_map = _scan_version_files(zf)
+            for so_name in target_so_names:
+                for kw in _so_keywords(so_name):
+                    if kw in version_map:
+                        so_to_source[so_name].append(version_map[kw])
+                        break
+
+            # 策略 3: DEX 包名搜索
+            unresolved = {
+                name for name in target_so_names
+                if not so_to_source.get(name)
+            }
+            if unresolved:
+                dex_matches = _scan_dex_for_so(zf, unresolved)
+                for so_name, packages in dex_matches.items():
+                    for pkg in packages:
+                        so_to_source[so_name].append(pkg)
+
+            # 策略 4: APK 文件路径匹配
+            still_unresolved = {
+                name for name in target_so_names
+                if not so_to_source.get(name)
+            }
+            if still_unresolved:
+                entry_matches = _scan_apk_entries(all_entries, still_unresolved)
+                for so_name, entries in entry_matches.items():
+                    if not so_to_source.get(so_name):
+                        for e in entries[:3]:
+                            so_to_source[so_name].append(f"APK 路径: {e}")
+
+    except (zipfile.BadZipFile, OSError):
+        pass
+
+    # 策略 5: 用户指定的外部目录
+    if search_dirs:
+        still_unresolved = {
+            name for name in target_so_names
+            if not so_to_source.get(name)
+        }
+        if still_unresolved:
+            _scan_external_dirs(search_dirs, still_unresolved, so_to_source)
+
+    return dict(so_to_source)
+
+
+def _scan_external_dirs(
+    search_dirs: list[str],
+    target_so_names: set[str],
+    so_to_source: dict[str, list[str]],
+) -> None:
+    """在外部目录中搜索包含目标 .so 的 .aar/.jar 文件"""
+    seen: set[str] = set()
     for search_dir in search_dirs:
         search_dir = os.path.expanduser(search_dir)
         if not os.path.isdir(search_dir):
             continue
-
-        # 搜索 .aar 文件
-        for root, dirs, files in os.walk(search_dir):
+        for root, _dirs, files in os.walk(search_dir):
             for f in files:
-                if not f.endswith(".aar"):
+                lower = f.lower()
+                if not (lower.endswith(".aar") or lower.endswith(".jar")):
                     continue
-                aar_path = os.path.join(root, f)
-                real_path = os.path.realpath(aar_path)
-                if real_path in seen_aars:
+                fpath = os.path.join(root, f)
+                real = os.path.realpath(fpath)
+                if real in seen:
                     continue
-                seen_aars.add(real_path)
-
+                seen.add(real)
                 try:
-                    with zipfile.ZipFile(aar_path, "r") as zf:
+                    with zipfile.ZipFile(fpath, "r") as zf:
                         for entry in zf.namelist():
-                            if entry.startswith("jni/") and entry.endswith(".so"):
+                            if entry.endswith(".so"):
                                 so_name = os.path.basename(entry)
-                                so_to_aar[so_name].append(aar_path)
+                                if so_name in target_so_names:
+                                    so_to_source[so_name].append(
+                                        _format_archive_path(fpath)
+                                    )
+                                    break
                 except (zipfile.BadZipFile, OSError):
                     continue
 
-    return dict(so_to_aar)
 
+def _format_archive_path(fpath: str) -> str:
+    """
+    尝试从归档路径中提取 Maven 坐标。
+    支持 Gradle 缓存和 Maven 本地仓库两种路径格式。
+    """
+    parts = os.path.normpath(fpath).split(os.sep)
 
-def get_default_search_dirs() -> list[str]:
-    """获取默认的 AAR 搜索目录（Gradle 缓存等）"""
-    dirs = []
-
-    # Gradle 缓存目录
-    gradle_home = os.environ.get("GRADLE_USER_HOME", os.path.expanduser("~/.gradle"))
-    gradle_caches = os.path.join(gradle_home, "caches")
-    if os.path.isdir(gradle_caches):
-        # Gradle 模块缓存中的 AAR 文件
-        modules_dir = os.path.join(gradle_caches, "modules-2", "files-2.1")
-        if os.path.isdir(modules_dir):
-            dirs.append(modules_dir)
-        # 也检查 transforms 目录
-        transforms_dir = os.path.join(gradle_caches, "transforms-3")
-        if os.path.isdir(transforms_dir):
-            dirs.append(transforms_dir)
-
-    # Maven 本地仓库
-    m2_repo = os.path.expanduser("~/.m2/repository")
-    if os.path.isdir(m2_repo):
-        dirs.append(m2_repo)
-
-    return dirs
-
-
-def find_aar_for_so(
-    so_name: str,
-    aar_index: Optional[dict[str, list[str]]] = None,
-    search_dirs: Optional[list[str]] = None,
-) -> list[str]:
-    """根据 .so 文件名查找可能包含它的 AAR"""
-    if aar_index is not None:
-        return aar_index.get(so_name, [])
-
-    # 如果没有预建索引，实时搜索
-    dirs = search_dirs or get_default_search_dirs()
-    index = build_aar_so_index(dirs)
-    return index.get(so_name, [])
-
-
-def format_aar_path(aar_path: str) -> str:
-    """尝试从 AAR 路径中提取 Maven 坐标信息"""
-    parts = Path(aar_path).parts
-
-    # 尝试匹配 Gradle 缓存路径模式:
-    # ~/.gradle/caches/modules-2/files-2.1/<group>/<artifact>/<version>/<hash>/<file>.aar
+    # Gradle: .../files-2.1/<group>/<artifact>/<version>/<hash>/<file>
     try:
         idx = parts.index("files-2.1")
         if idx + 3 < len(parts):
-            group = parts[idx + 1]
-            artifact = parts[idx + 2]
-            version = parts[idx + 3]
-            return f"{group}:{artifact}:{version} ({aar_path})"
-    except (ValueError, IndexError):
+            return f"{parts[idx+1]}:{parts[idx+2]}:{parts[idx+3]}"
+    except ValueError:
         pass
 
-    # 尝试匹配 Maven 本地仓库路径模式:
-    # ~/.m2/repository/<group_path>/<artifact>/<version>/<file>.aar
+    # Maven: .../repository/<group_path>/<artifact>/<version>/<file>
     try:
         idx = parts.index("repository")
         if idx + 3 < len(parts):
-            aar_file = parts[-1]
             version = parts[-2]
             artifact = parts[-3]
-            group_parts = parts[idx + 1:-3]
-            group = ".".join(group_parts)
-            return f"{group}:{artifact}:{version} ({aar_path})"
-    except (ValueError, IndexError):
+            group = ".".join(parts[idx+1:-3])
+            return f"{group}:{artifact}:{version}"
+    except ValueError:
         pass
 
-    return aar_path
+    return fpath
 
 
 # ──────────────────── APK 检查主逻辑 ────────────────────
@@ -342,7 +570,7 @@ def check_apk(
     apk_path: str,
     check_all_abis: bool = False,
     search_dirs: Optional[list[str]] = None,
-    no_aar_search: bool = False,
+    no_source_search: bool = False,
 ) -> list[SoCheckResult]:
     """
     检查 APK 中所有 .so 文件的 16KB 对齐情况。
@@ -350,8 +578,8 @@ def check_apk(
     Args:
         apk_path: APK 文件路径
         check_all_abis: 是否检查所有 ABI（默认只检查 64 位）
-        search_dirs: 额外的 AAR 搜索目录
-        no_aar_search: 是否跳过 AAR 搜索
+        search_dirs: 额外的搜索目录
+        no_source_search: 是否跳过来源搜索
 
     Returns:
         所有 .so 文件的检查结果
@@ -365,9 +593,10 @@ def check_apk(
 
     try:
         with zipfile.ZipFile(apk_path, "r") as zf:
+            # 遍历 APK 中所有 .so 文件（不仅是 lib/ 下的）
             so_entries = [
                 name for name in zf.namelist()
-                if name.startswith("lib/") and name.endswith(".so")
+                if name.endswith(".so")
             ]
 
             if not so_entries:
@@ -376,15 +605,23 @@ def check_apk(
 
             for entry_name in sorted(so_entries):
                 parts = entry_name.split("/")
-                if len(parts) < 3:
-                    continue
 
-                abi = parts[1]
-                so_name = parts[-1]
+                # 标准路径 lib/<abi>/<name>.so
+                if entry_name.startswith("lib/") and len(parts) >= 3:
+                    abi = parts[1]
+                    so_name = parts[-1]
+                else:
+                    # 非标准位置的 .so（如 assets/ 等）
+                    abi = "other"
+                    so_name = parts[-1]
 
                 # 过滤 ABI
                 if not check_all_abis and abi not in TARGET_ABIS_REQUIRED:
-                    continue
+                    if abi != "other":
+                        continue
+                    # other 路径下的 .so 仅在 --all-abis 时检查
+                    if not check_all_abis:
+                        continue
 
                 # 读取 .so 数据并检查 ELF 对齐
                 so_data = zf.read(entry_name)
@@ -413,29 +650,24 @@ def check_apk(
         print(f"错误: 不是有效的 ZIP/APK 文件: {apk_path}", file=sys.stderr)
         sys.exit(1)
 
-    # 为不合规的 .so 文件查找对应的 AAR
-    if non_compliant_so_names and not no_aar_search:
-        all_search_dirs = get_default_search_dirs()
-        if search_dirs:
-            all_search_dirs.extend(search_dirs)
+    # 为不合规的 .so 文件查找来源
+    if non_compliant_so_names and not no_source_search:
+        print("正在分析 .so 来源...", file=sys.stderr)
 
-        if all_search_dirs:
-            print("正在搜索 AAR 文件...")
-            aar_index = build_aar_so_index(all_search_dirs)
+        source_index = trace_so_sources(
+            apk_path, non_compliant_so_names, search_dirs
+        )
 
-            for result in results:
-                if not result.is_compliant:
-                    aar_paths = aar_index.get(result.so_name, [])
-                    formatted = [format_aar_path(p) for p in aar_paths]
-                    # 按 Maven 坐标去重（不同 hash 目录下的同一版本只保留一条）
-                    seen = set()
-                    deduped = []
-                    for f in formatted:
-                        coord = f.split(" (")[0] if " (" in f else f
-                        if coord not in seen:
-                            seen.add(coord)
-                            deduped.append(f)
-                    result.aar_sources = deduped
+        # 去重并赋值
+        for result in results:
+            if not result.is_compliant and result.so_name in source_index:
+                seen: set[str] = set()
+                deduped: list[str] = []
+                for s in source_index[result.so_name]:
+                    if s not in seen:
+                        seen.add(s)
+                        deduped.append(s)
+                result.aar_sources = deduped
 
     return results
 
@@ -451,13 +683,13 @@ def align_str(align_value: int) -> str:
     return f"2**{power}"
 
 
-def _shorten_aar(aar_display: str) -> str:
-    """缩短 AAR 显示路径，只保留 Maven 坐标部分"""
-    if " (" in aar_display:
-        return aar_display.split(" (")[0]
-    if len(aar_display) > 50:
-        return "..." + aar_display[-47:]
-    return aar_display
+def _shorten_aar(source: str) -> str:
+    """缩短来源显示，只保留关键信息"""
+    if " (" in source:
+        return source.split(" (")[0]
+    if len(source) > 50:
+        return "..." + source[-47:]
+    return source
 
 
 def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = False):
@@ -498,7 +730,7 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
     sep = (f" {'-'*col_no} {'-'*col_so} {'-'*col_abi}"
            f" {'-'*col_elf} {'-'*col_zip} {'-'*col_aar}")
 
-    print(fmt.format("序号", "SO 文件", "ABI", "ELF对齐", "ZIP对齐", "AAR 来源"))
+    print(fmt.format("序号", "SO 文件", "ABI", "ELF对齐", "ZIP对齐", "来源"))
     print(sep)
 
     for i, r in enumerate(non_compliant_results, 1):
@@ -558,7 +790,7 @@ def results_to_dict(results: list[SoCheckResult], apk_path: str) -> dict:
                 "is_aligned": r.zip_result.is_aligned,
             }
         if r.aar_sources:
-            item["aar_sources"] = r.aar_sources
+            item["sources"] = r.aar_sources
         items.append(item)
 
     total = len(results)
@@ -586,7 +818,7 @@ def main():
   %(prog)s app.apk --search-dir ./libs --search-dir /path/to/aars
   %(prog)s app.apk --json
   %(prog)s app.apk --verbose
-  %(prog)s app.apk --no-aar-search
+  %(prog)s app.apk --no-source-search
         """,
     )
     parser.add_argument("apk", nargs="?", default=None, help="APK 文件路径（不提供则交互式输入）")
@@ -596,11 +828,11 @@ def main():
     )
     parser.add_argument(
         "--search-dir", action="append", dest="search_dirs", default=[],
-        help="额外的 AAR 搜索目录（可多次指定）",
+        help="额外的 .aar/.jar 搜索目录，用于追溯 .so 来源（可多次指定）",
     )
     parser.add_argument(
-        "--no-aar-search", action="store_true",
-        help="跳过 AAR 来源搜索",
+        "--no-source-search", action="store_true",
+        help="跳过 .so 来源搜索",
     )
     parser.add_argument(
         "--json", action="store_true",
@@ -626,7 +858,7 @@ def main():
         apk_path=apk_path,
         check_all_abis=args.all_abis,
         search_dirs=args.search_dirs if args.search_dirs else None,
-        no_aar_search=args.no_aar_search,
+        no_source_search=args.no_source_search,
     )
 
     if args.json:
