@@ -7,8 +7,9 @@ APK 16KB Page Size Alignment Checker
 1. ELF 对齐检查：PT_LOAD 段的 p_align 是否 >= 16384 (2**14)
 2. ZIP 对齐检查：未压缩的 .so 文件在 APK (ZIP) 中的偏移是否 16KB 对齐
 
-对于不合规的 .so 文件，通过遍历 APK 内的所有嵌套归档（.aar/.jar）以及
-用户指定的外部目录来追溯 .so 的依赖来源。
+对于不合规的 .so 文件，优先从本地 Gradle/Maven 依赖缓存中反推精确的 Maven
+坐标，如未找到则通过分析 APK 内文件（嵌套归档、META-INF 版本文件、
+DEX 字符串池、文件路径）推测依赖来源。
 """
 
 import argparse
@@ -255,12 +256,18 @@ def _so_keywords(so_name: str) -> list[str]:
     return keywords
 
 
-def _scan_version_files(zf: zipfile.ZipFile) -> dict[str, str]:
+def _scan_version_files(
+    zf: zipfile.ZipFile,
+) -> tuple[dict[str, str], dict[str, list[tuple[str, str]]]]:
     """
-    读取 APK 中 META-INF/<group>_<artifact>.version 文件，
-    返回 artifact_keyword -> group:artifact:version 的映射。
+    读取 APK 中 META-INF/<group>_<artifact>.version 文件。
+
+    Returns:
+        versions: artifact_keyword -> group:artifact:version
+        groups: group -> [(artifact, version), ...]
     """
     versions: dict[str, str] = {}
+    groups: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for name in zf.namelist():
         if not (name.startswith("META-INF/") and name.endswith(".version")):
             continue
@@ -277,7 +284,43 @@ def _scan_version_files(zf: zipfile.ZipFile) -> dict[str, str]:
         art_lower = artifact.lower()
         versions[art_lower] = coord
         versions[art_lower.replace("-", "")] = coord
-    return versions
+        groups[group].append((artifact, ver))
+    return versions, dict(groups)
+
+
+def _package_to_artifact(
+    pkg: str,
+    version_map: dict[str, str],
+    groups: dict[str, list[tuple[str, str]]],
+) -> str:
+    """
+    将 Java 包名转换为可能的 Maven 坐标。
+
+    例: com.facebook.imagepipeline → com.facebook:imagepipeline (推测)
+    """
+    parts = pkg.split(".")
+    if len(parts) < 2:
+        return pkg
+
+    artifact_candidate = parts[-1]
+    art_kw = artifact_candidate.lower().replace("-", "")
+
+    # 直接匹配 META-INF 版本文件
+    if art_kw in version_map:
+        return version_map[art_kw]
+
+    # 尝试匹配已知的 group
+    for i in range(len(parts) - 1, 0, -1):
+        group_candidate = ".".join(parts[:i])
+        if group_candidate in groups:
+            for art, ver in groups[group_candidate]:
+                if art.lower().replace("-", "") == art_kw:
+                    return f"{group_candidate}:{art}:{ver}"
+            return f"{group_candidate}:{artifact_candidate} (推测)"
+
+    # 无匹配，使用启发式推测: 倒数第二段以上作为 group，最后一段作为 artifact
+    group = ".".join(parts[:-1])
+    return f"{group}:{artifact_candidate} (推测)"
 
 
 def _scan_dex_for_so(zf: zipfile.ZipFile, so_names: set[str]) -> dict[str, list[str]]:
@@ -413,19 +456,68 @@ def _scan_apk_entries(
     return dict(result)
 
 
+def _version_sort_key(coord: str) -> tuple:
+    """提取版本号用于排序比较，版本号越高 key 越大"""
+    parts = coord.rsplit(":", 1)
+    if len(parts) != 2:
+        return (0,)
+    try:
+        return tuple(int(x) for x in parts[1].split("."))
+    except ValueError:
+        return (0,)
+
+
+def _filter_gradle_versions(
+    sources: list[str],
+    version_map: dict[str, str],
+) -> list[str]:
+    """
+    从多个 Gradle 缓存版本中，借助 META-INF 版本信息筛选出 APK 实际使用的版本。
+    对于同一 group:artifact，优先使用 META-INF 确认的版本，否则取最新版本。
+    """
+    if len(sources) <= 1:
+        return sources
+
+    # 按 group:artifact 分组
+    ga_coords: dict[str, list[str]] = defaultdict(list)
+    other: list[str] = []
+    for coord in sources:
+        parts = coord.rsplit(":", 1)
+        if len(parts) == 2:
+            ga_coords[parts[0]].append(coord)
+        else:
+            other.append(coord)
+
+    result: list[str] = []
+    for ga, coords in ga_coords.items():
+        artifact = ga.rsplit(":", 1)[-1]
+        art_kw = artifact.lower().replace("-", "")
+        if art_kw in version_map:
+            result.append(version_map[art_kw])
+        elif len(coords) == 1:
+            result.append(coords[0])
+        else:
+            # META-INF 无此 artifact 信息，取最新版本
+            result.append(max(coords, key=_version_sort_key))
+    result.extend(other)
+    return result
+
+
 def trace_so_sources(
     apk_path: str,
     target_so_names: set[str],
     search_dirs: Optional[list[str]] = None,
 ) -> dict[str, list[str]]:
     """
-    综合分析 APK 内所有文件，追溯 .so 文件的依赖来源。
+    综合分析 Gradle/Maven 缓存和 APK 内所有文件，追溯 .so 文件的依赖来源。
 
     分析策略（按优先级）：
+    0. 本地 Gradle/Maven 依赖缓存（精确 Maven 坐标，通过 META-INF 交叉验证版本）
     1. APK 内嵌套的 .aar/.jar 归档
-    2. META-INF 版本文件 + DEX 包名联合匹配
-    3. APK 文件路径关键字匹配
-    4. 用户指定的外部目录中的 .aar/.jar 文件
+    2. META-INF 版本文件 + 关键字匹配
+    3. DEX 包名搜索 + Maven 坐标推测
+    4. APK 文件路径关键字匹配
+    5. 用户指定的外部目录中的 .aar/.jar 文件
 
     Returns:
         so_name -> [来源描述] 的映射
@@ -434,61 +526,92 @@ def trace_so_sources(
     if not target_so_names:
         return dict(so_to_source)
 
+    # ── 策略 0: 自动检测并扫描 Gradle/Maven 依赖缓存 ──
+    auto_caches = _find_dependency_caches()
+    gradle_raw: dict[str, list[str]] = defaultdict(list)
+    if auto_caches:
+        print(f"  检测到本地依赖缓存: {', '.join(auto_caches)}", file=sys.stderr)
+        _scan_external_dirs(auto_caches, target_so_names, gradle_raw)
+
     try:
         with zipfile.ZipFile(apk_path, "r") as zf:
             all_entries = zf.namelist()
 
-            # 策略 1: 扫描嵌套归档（.aar/.jar）
-            for name in all_entries:
-                lower = name.lower()
-                if not (lower.endswith(".aar") or lower.endswith(".jar")):
-                    continue
-                try:
-                    archive_data = zf.read(name)
-                    with zipfile.ZipFile(io.BytesIO(archive_data), "r") as inner_zf:
-                        for inner_name in inner_zf.namelist():
-                            if inner_name.endswith(".so"):
-                                so_name = os.path.basename(inner_name)
-                                if so_name in target_so_names:
-                                    so_to_source[so_name].append(f"APK!{name}")
-                except (zipfile.BadZipFile, OSError):
-                    continue
+            # 始终读取 META-INF（用于 Gradle 版本交叉验证和后续策略）
+            version_map, groups = _scan_version_files(zf)
 
-            # 策略 2: META-INF 版本文件匹配
-            version_map = _scan_version_files(zf)
-            for so_name in target_so_names:
-                for kw in _so_keywords(so_name):
-                    if kw in version_map:
-                        so_to_source[so_name].append(version_map[kw])
-                        break
+            # 交叉验证: Gradle 结果 + META-INF 筛选正确版本
+            if gradle_raw:
+                for so_name, coords in gradle_raw.items():
+                    filtered = _filter_gradle_versions(coords, version_map)
+                    so_to_source[so_name].extend(filtered)
 
-            # 策略 3: DEX 包名搜索
-            unresolved = {
+            # ── 以下策略仅对 Gradle 未找到的 .so 执行 ──
+            apk_targets = {
                 name for name in target_so_names
                 if not so_to_source.get(name)
             }
-            if unresolved:
-                dex_matches = _scan_dex_for_so(zf, unresolved)
-                for so_name, packages in dex_matches.items():
-                    for pkg in packages:
-                        so_to_source[so_name].append(pkg)
 
-            # 策略 4: APK 文件路径匹配
-            still_unresolved = {
-                name for name in target_so_names
-                if not so_to_source.get(name)
-            }
-            if still_unresolved:
-                entry_matches = _scan_apk_entries(all_entries, still_unresolved)
-                for so_name, entries in entry_matches.items():
-                    if not so_to_source.get(so_name):
-                        for e in entries[:3]:
-                            so_to_source[so_name].append(f"APK 路径: {e}")
+            if apk_targets:
+                # 策略 1: 扫描嵌套归档（.aar/.jar）
+                for name in all_entries:
+                    lower = name.lower()
+                    if not (lower.endswith(".aar") or lower.endswith(".jar")):
+                        continue
+                    try:
+                        archive_data = zf.read(name)
+                        with zipfile.ZipFile(io.BytesIO(archive_data), "r") as inner_zf:
+                            for inner_name in inner_zf.namelist():
+                                if inner_name.endswith(".so"):
+                                    so_name = os.path.basename(inner_name)
+                                    if so_name in apk_targets:
+                                        so_to_source[so_name].append(f"APK!{name}")
+                    except (zipfile.BadZipFile, OSError):
+                        continue
+
+                # 策略 2: META-INF 版本文件关键字匹配
+                for so_name in apk_targets:
+                    for kw in _so_keywords(so_name):
+                        if kw in version_map:
+                            so_to_source[so_name].append(version_map[kw])
+                            break
+
+                # 策略 3: DEX 包名搜索
+                unresolved = {
+                    name for name in apk_targets
+                    if not so_to_source.get(name)
+                }
+                if unresolved:
+                    dex_matches = _scan_dex_for_so(zf, unresolved)
+                    for so_name, packages in dex_matches.items():
+                        for pkg in packages:
+                            if pkg == "System.loadLibrary 引用":
+                                so_to_source[so_name].append(pkg)
+                            else:
+                                coord = _package_to_artifact(
+                                    pkg, version_map, groups
+                                )
+                                so_to_source[so_name].append(coord)
+
+                # 策略 4: APK 文件路径匹配
+                still_unresolved = {
+                    name for name in apk_targets
+                    if not so_to_source.get(name)
+                }
+                if still_unresolved:
+                    entry_matches = _scan_apk_entries(all_entries, still_unresolved)
+                    for so_name, entries in entry_matches.items():
+                        if not so_to_source.get(so_name):
+                            for e in entries[:3]:
+                                so_to_source[so_name].append(f"APK 路径: {e}")
 
     except (zipfile.BadZipFile, OSError):
-        pass
+        # APK 无法打开时，仍使用 Gradle 原始结果
+        if gradle_raw and not so_to_source:
+            for so_name, coords in gradle_raw.items():
+                so_to_source[so_name].extend(coords)
 
-    # 策略 5: 用户指定的外部目录
+    # ── 策略 5: 用户指定的外部目录 ──
     if search_dirs:
         still_unresolved = {
             name for name in target_so_names
@@ -562,6 +685,30 @@ def _format_archive_path(fpath: str) -> str:
         pass
 
     return fpath
+
+
+def _find_dependency_caches() -> list[str]:
+    """
+    自动检测本地 Gradle 和 Maven 依赖缓存目录。
+
+    检测位置:
+    - Gradle: $GRADLE_USER_HOME/caches/modules-2/files-2.1
+              或 ~/.gradle/caches/modules-2/files-2.1
+    - Maven:  ~/.m2/repository
+    """
+    dirs: list[str] = []
+    gradle_home = os.environ.get(
+        "GRADLE_USER_HOME", os.path.expanduser("~/.gradle")
+    )
+    gradle_cache = os.path.join(
+        gradle_home, "caches", "modules-2", "files-2.1"
+    )
+    if os.path.isdir(gradle_cache):
+        dirs.append(gradle_cache)
+    m2_repo = os.path.expanduser("~/.m2/repository")
+    if os.path.isdir(m2_repo):
+        dirs.append(m2_repo)
+    return dirs
 
 
 # ──────────────────── APK 检查主逻辑 ────────────────────
@@ -652,7 +799,7 @@ def check_apk(
 
     # 为不合规的 .so 文件查找来源
     if non_compliant_so_names and not no_source_search:
-        print("正在分析 .so 来源...", file=sys.stderr)
+        print("正在分析 .so 来源（Gradle 缓存 + APK 内容）...", file=sys.stderr)
 
         source_index = trace_so_sources(
             apk_path, non_compliant_so_names, search_dirs
@@ -675,17 +822,24 @@ def check_apk(
 # ──────────────────── 输出格式化 ────────────────────
 
 def align_str(align_value: int) -> str:
-    """将对齐值转换为可读字符串"""
+    """将对齐值转换为可读字符串，如 4KB、16KB"""
     if align_value == 0:
         return "0"
-    import math
-    power = int(math.log2(align_value)) if align_value > 0 else 0
-    return f"2**{power}"
+    if align_value >= 1024 and align_value % 1024 == 0:
+        kb = align_value // 1024
+        if kb >= 1024 and kb % 1024 == 0:
+            return f"{kb // 1024}MB"
+        return f"{kb}KB"
+    return f"{align_value}B"
 
 
-def _shorten_aar(source: str) -> str:
-    """缩短来源显示，只保留关键信息"""
-    if " (" in source:
+def _shorten_source(source: str) -> str:
+    """缩短来源显示，保留 Maven 坐标和推测标记"""
+    # 保留 "(推测)" 标记
+    if source.endswith("(推测)"):
+        return source
+    # 去掉长路径注释 "coord (path/to/file)"
+    if " (" in source and source.endswith(")"):
         return source.split(" (")[0]
     if len(source) > 50:
         return "..." + source[-47:]
@@ -702,7 +856,7 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
     non_compliant = total - compliant
     apk_size = os.path.getsize(apk_path) / 1024 / 1024
 
-    W = 100
+    W = 120
     print()
     print("=" * W)
     print(f" APK 16KB 页面大小对齐检查报告")
@@ -722,9 +876,9 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
     col_no  = 4
     col_so  = 34
     col_abi = 13
-    col_elf = 11
+    col_elf = 8
     col_zip = 11
-    col_aar = 38
+    col_aar = 45
     fmt = (f" {{:<{col_no}}} {{:<{col_so}}} {{:<{col_abi}}}"
            f" {{:<{col_elf}}} {{:<{col_zip}}} {{:<{col_aar}}}")
     sep = (f" {'-'*col_no} {'-'*col_so} {'-'*col_abi}"
@@ -741,7 +895,7 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
         else:
             zip_str = "-"
 
-        aar_list = [_shorten_aar(a) for a in r.aar_sources] if r.aar_sources else ["未找到"]
+        aar_list = [_shorten_source(a) for a in r.aar_sources] if r.aar_sources else ["未找到"]
 
         # 第一行：序号 + 所有字段 + AAR 第一条
         print(fmt.format(i, r.so_name, r.abi, elf_align, zip_str, aar_list[0]))
@@ -749,12 +903,14 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
         for extra in aar_list[1:]:
             print(fmt.format("", "", "", "", "", extra))
 
-        # verbose: 每个 LOAD 段详情
-        if verbose and r.elf_result and r.elf_result.load_segments:
-            for j, seg in enumerate(r.elf_result.load_segments):
-                tag = "  OK" if seg.align >= ALIGN_16KB else "  !!"
-                print(f"      LOAD[{j}]  offset=0x{seg.offset:08X}  vaddr=0x{seg.vaddr:08X}"
-                      f"  filesz=0x{seg.filesz:08X}  align={align_str(seg.align)}{tag}")
+        # verbose: 路径 + 每个 LOAD 段详情
+        if verbose:
+            print(f"      路径: {r.path_in_apk}")
+            if r.elf_result and r.elf_result.load_segments:
+                for j, seg in enumerate(r.elf_result.load_segments):
+                    tag = "  OK" if seg.align >= ALIGN_16KB else "  !!"
+                    print(f"      LOAD[{j}]  offset=0x{seg.offset:08X}  vaddr=0x{seg.vaddr:08X}"
+                          f"  filesz=0x{seg.filesz:08X}  align={align_str(seg.align)} (0x{seg.align:X}){tag}")
 
     print(f"\n {'─' * (W - 2)}")
     print(f" 结论: {non_compliant}/{total} 个共享库需要使用 16KB 对齐方式重新编译。")
@@ -778,8 +934,13 @@ def results_to_dict(results: list[SoCheckResult], apk_path: str) -> dict:
             item["elf"] = {
                 "is_aligned": r.elf_result.is_aligned,
                 "min_align": r.elf_result.min_align,
+                "min_align_display": align_str(r.elf_result.min_align),
                 "load_segments": [
-                    {"offset": s.offset, "align": s.align}
+                    {
+                        "offset": s.offset,
+                        "align": s.align,
+                        "align_display": align_str(s.align),
+                    }
                     for s in r.elf_result.load_segments
                 ],
             }
