@@ -49,31 +49,52 @@ python3 apk_16kb_checker.py app.apk --no-source-search
 
 ## 输出示例
 
-### 默认模式
+终端输出支持颜色高亮：不合规项以红色/黄色标注，通过以绿色显示。重定向到文件或管道时自动关闭颜色（可通过 `NO_COLOR=1` 环境变量强制关闭）。
+
+### 全部通过
 
 ```
-========================================================================================================================
+================================================================================================================================
+ APK 16KB 页面大小对齐检查报告
+ 文件: app.apk
+ 大小: 95.79 MB  |  共 25 个 .so 文件  |  通过: 25  |  不合规: 0
+================================================================================================================================
+
+ ✅ 通过  所有 25 个共享库均符合 16KB 对齐规范。
+```
+
+### 存在不合规项
+
+```
+================================================================================================================================
  APK 16KB 页面大小对齐检查报告
  文件: app.apk
  大小: 65.02 MB  |  共 24 个 .so 文件  |  通过: 15  |  不合规: 9
-========================================================================================================================
+================================================================================================================================
 
- [不合规] 9 个共享库不符合 16KB 对齐规范。
+ ❌ 不合规  9 个共享库不符合 16KB 对齐规范。
 
- 序号   SO 文件                              ABI           ELF对齐    ZIP对齐       来源
- ---- ---------------------------------- ------------- -------- ----------- ---------------------------------------------
- 1    libgifimage.so                     arm64-v8a     4KB      已压缩         com.facebook.fresco:animated-gif:2.5.0
- 2    libimagepipeline.so                arm64-v8a     4KB      已压缩         com.facebook.fresco:imagepipeline:2.5.0
-                                                                            com.facebook.fresco:imagepipeline-native:2.5.0
- 3    libnative-filters.so               arm64-v8a     4KB      已压缩         com.facebook.fresco:nativeimagefilters:2.5.0
- 4    libnative-imagetranscoder.so       arm64-v8a     4KB      已压缩         com.facebook.fresco:nativeimagetranscoder:2.5.0
- 5    libsecsdk.so                       x86_64        4KB      已压缩         System.loadLibrary 引用
+ 序号   SO 文件                              ABI           ELF对齐            ZIP对齐       来源
+ ---- ---------------------------------- ------------- ---------------- ----------- ---------------------------------------------
+ 1    libgifimage.so                     arm64-v8a     4KB              已压缩         com.facebook.fresco:animated-gif:2.5.0
+ 2    libimagepipeline.so                arm64-v8a     4KB              已压缩         com.facebook.fresco:imagepipeline:2.5.0
+                                                                                    com.facebook.fresco:imagepipeline-native:2.5.0
+ 3    libnative-filters.so               arm64-v8a     4KB              已压缩         com.facebook.fresco:nativeimagefilters:2.5.0
+ 4    libnative-imagetranscoder.so       arm64-v8a     4KB              已压缩         com.facebook.fresco:nativeimagetranscoder:2.5.0
+ 5    libdcblur.so                       arm64-v8a     64KB/RELRO异常     已压缩         本地依赖: lib.5plus.base-release.aar
+ 6    libsecsdk.so                       x86_64        4KB              已压缩         System.loadLibrary 引用
  ...
 
  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  结论: 9/24 个共享库需要使用 16KB 对齐方式重新编译。
  参考: https://developer.android.com/guide/practices/page-sizes
 ```
+
+颜色含义（终端中）：
+- 🔴 红色：ELF对齐 < 16KB（不合规），或 ZIP 未对齐
+- 🟡 黄色：ELF p_align >= 16KB 但存在 RELRO 问题；SO 文件名
+- 🟢 绿色：全部通过，或 ZIP 已对齐
+- 暗色：表头、分隔线、已压缩状态、未找到来源
 
 来源列说明：
 - **精确 Maven 坐标**（如 `com.facebook.fresco:imagepipeline:2.5.0`）：从本地 Gradle/Maven 缓存中反推，或从 APK 内 META-INF 版本文件精确匹配
@@ -87,7 +108,7 @@ python3 apk_16kb_checker.py app.apk --no-source-search
 在默认输出基础上，每条不合规记录额外展示 APK 内路径和所有 ELF PT_LOAD 段详情：
 
 ```
- 1    libgifimage.so                     arm64-v8a     4KB      已压缩         com.facebook.fresco:animated-gif:2.5.0
+ 1    libgifimage.so                     arm64-v8a     4KB              已压缩         com.facebook.fresco:animated-gif:2.5.0
       路径: lib/arm64-v8a/libgifimage.so
       LOAD[0]  offset=0x00000000  vaddr=0x00000000  filesz=0x00038D3C  align=4KB (0x1000)  !!
       LOAD[1]  offset=0x000399D0  vaddr=0x0003A9D0  filesz=0x000038B0  align=4KB (0x1000)  !!
@@ -165,6 +186,118 @@ APK 是 ZIP 格式文件。对于未压缩存储的 .so 文件，其数据起始
 |--------|------|
 | `0` | 所有 .so 文件均合规 |
 | `1` | 存在不合规的 .so 文件 |
+
+---
+
+## aar_16kb_fixer.py — AAR 修补工具
+
+对已知不合规的 AAR 文件，自动将其中 .so 的 ELF 对齐修补为 16KB，输出新的 AAR 文件。合规规则与 `apk_16kb_checker.py` 完全一致。
+
+### 修补原理
+
+| 问题类型 | 修补方式 |
+|---------|---------|
+| `p_align < 16KB`，且 `p_offset ≡ p_vaddr (mod 16KB)` 已成立 | 仅修改 `p_align` 字段为 16384 |
+| `p_align < 16KB`，且 `p_offset ≡ p_vaddr (mod 16KB)` 不成立 | 在段前插入零填充，同步更新 ELF/Program/Section Header 中所有偏移 |
+| `p_align` 已 >= 16KB 但 RELRO 结束位置不满足 16KB 规则 | **无法二进制修补**，需重新链接（见下方说明） |
+
+### 使用方法
+
+```bash
+# 基本修补（输出 原文件名_16kb.aar）
+python3 aar_16kb_fixer.py path/to/some.aar
+
+# 指定输出路径
+python3 aar_16kb_fixer.py some.aar -o fixed.aar
+
+# 仅检查，不实际修改
+python3 aar_16kb_fixer.py some.aar --dry-run
+
+# 用重新编译好的 .so 替换 AAR 中对应文件（见下方说明）
+python3 aar_16kb_fixer.py some.aar --replace-dir ./new_sos/
+```
+
+### --replace-dir：替换重新链接的 .so
+
+当 .so 存在 **RELRO 问题**（二进制修补无法解决）时，需要供应商提供重新编译的 .so 文件，再用此工具替换回 AAR：
+
+**目录结构方式一：按 ABI 子目录组织（只替换指定 ABI）**
+
+```
+new_sos/
+  arm64-v8a/
+    libfoo.so
+  armeabi-v7a/
+    libfoo.so
+```
+
+```bash
+python3 aar_16kb_fixer.py some.aar --replace-dir ./new_sos/
+```
+
+**目录结构方式二：平铺（替换 AAR 中所有 ABI 下同名 .so）**
+
+```
+new_sos/
+  libfoo.so
+```
+
+```bash
+python3 aar_16kb_fixer.py some.aar --replace-dir ./new_sos/
+```
+
+**实际示例：**
+
+假设拿到了 `__UNI__448B406/lib/arm64-v8a/libdcblur.so`，目录结构已经是 `lib/<abi>/libdcblur.so`，直接传 `lib` 那一层：
+
+```bash
+python3 aar_16kb_fixer.py lib.5plus.base-release.aar \
+    --replace-dir '__UNI__448B406/lib' \
+    -o lib.5plus.base-release_fixed.aar
+```
+
+### 输出示例
+
+```
+输入: lib.5plus.base-release.aar
+输出: lib.5plus.base-release_16kb.aar
+
+────────────────────────────────────────────────────────────────
+  ABI: arm64-v8a
+────────────────────────────────────────────────────────────────
+  SO 文件                                     原对齐  状态
+  ────────────────────────────────────── ──────  ────────────────
+  libdcblur.so                             64KB  ✗ p_align 已 16KB，但 RELRO 问题需重新链接
+    ⚠ RELRO end=0x12000 非 16KB 对齐且非后缀，需重新链接修复
+
+────────────────────────────────────────────────────────────────
+  ABI: armeabi-v7a
+────────────────────────────────────────────────────────────────
+  SO 文件                                     原对齐  状态
+  ────────────────────────────────────── ──────  ────────────────
+  libdcblur.so                              4KB  ✓ 已修补 (+4096 字节填充)
+
+════════════════════════════════════════════════════════════════
+  共 2 个 SO: 0 已合规, 1 已修补, 1 失败
+  ⚠ 1 个 SO 存在 RELRO 问题，需重新链接修复
+════════════════════════════════════════════════════════════════
+```
+
+### 关于 RELRO 问题
+
+RELRO 段的范围由链接器在链接时根据全局变量布局决定，无法通过修改偏移解决。解决方案：
+
+1. **自有 SO**：在 NDK 编译时添加链接参数：
+   ```cmake
+   # CMakeLists.txt
+   target_link_options(your_lib PRIVATE -Wl,-z,max-page-size=16384)
+   ```
+   ```makefile
+   # Android.mk
+   LOCAL_LDFLAGS += -Wl,-z,max-page-size=16384
+   ```
+
+2. **第三方 AAR**：等待供应商发布支持 16KB 的新版本，或使用 `--replace-dir` 导入供应商提供的重新编译版本。
 
 ## License
 

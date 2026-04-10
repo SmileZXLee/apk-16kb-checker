@@ -855,6 +855,53 @@ def check_apk(
 
 # ──────────────────── 输出格式化 ────────────────────
 
+# ──────────────────── 终端颜色 ────────────────────
+
+def _supports_color() -> bool:
+    """检测当前终端是否支持 ANSI 颜色。"""
+    if not sys.stdout.isatty():
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    return True
+
+
+_USE_COLOR = _supports_color()
+
+
+def _c(text: str, code: str) -> str:
+    """包装 ANSI 颜色代码，若终端不支持则原样返回。"""
+    if not _USE_COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _green(t: str) -> str:  return _c(t, "32")
+def _red(t: str)   -> str:  return _c(t, "31")
+def _yellow(t: str) -> str: return _c(t, "33")
+def _bold(t: str)  -> str:  return _c(t, "1")
+def _dim(t: str)   -> str:  return _c(t, "2")
+
+
+import re as _re
+_ANSI_ESCAPE = _re.compile(r"\033\[[0-9;]*m")
+
+
+def _visible_len(s: str) -> int:
+    """返回字符串去掉 ANSI 转义后的可见字符长度。"""
+    return len(_ANSI_ESCAPE.sub("", s))
+
+
+def _ljust(s: str, width: int) -> str:
+    """感知 ANSI 颜色码的左对齐填充，等效于 s.ljust(width)。"""
+    pad = width - _visible_len(s)
+    return s + " " * max(pad, 0)
+
+
+# ──────────────────── 工具函数 ────────────────────
+
 def align_str(align_value: int) -> str:
     """将对齐值转换为可读字符串，如 4KB、16KB"""
     if align_value == 0:
@@ -894,17 +941,27 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
 
     W = 128
     print()
-    print("=" * W)
-    print(f" APK 16KB 页面大小对齐检查报告")
+    print(_bold("=" * W))
+    print(_bold(f" APK 16KB 页面大小对齐检查报告"))
     print(f" 文件: {apk_path}")
-    print(f" 大小: {apk_size:.2f} MB  |  共 {total} 个 .so 文件  |  通过: {compliant}  |  不合规: {non_compliant}")
-    print("=" * W)
+    if non_compliant == 0:
+        summary = (f" 大小: {apk_size:.2f} MB  |  共 {total} 个 .so 文件  |  "
+                   + _green(f"通过: {compliant}") + f"  |  不合规: {non_compliant}")
+    else:
+        summary = (f" 大小: {apk_size:.2f} MB  |  共 {total} 个 .so 文件  |  通过: {compliant}  |  "
+                   + _red(f"不合规: {non_compliant}"))
+    print(summary)
+    print(_bold("=" * W))
 
     if non_compliant == 0:
-        print(f"\n [通过] 所有 {total} 个共享库均符合 16KB 对齐规范。\n")
+        print()
+        print(_green(_bold(" ✅ 通过")) + _green(f"  所有 {total} 个共享库均符合 16KB 对齐规范。"))
+        print()
         return
 
-    print(f"\n [不合规] {non_compliant} 个共享库不符合 16KB 对齐规范。\n")
+    print()
+    print(_red(_bold(" ❌ 不合规")) + _red(f"  {non_compliant} 个共享库不符合 16KB 对齐规范。"))
+    print()
 
     # ── 不合规文件汇总表 ──
     non_compliant_results = [r for r in results if not r.is_compliant]
@@ -915,13 +972,20 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
     col_elf = 16
     col_zip = 11
     col_aar = 45
-    fmt = (f" {{:<{col_no}}} {{:<{col_so}}} {{:<{col_abi}}}"
-           f" {{:<{col_elf}}} {{:<{col_zip}}} {{:<{col_aar}}}")
-    sep = (f" {'-'*col_no} {'-'*col_so} {'-'*col_abi}"
-           f" {'-'*col_elf} {'-'*col_zip} {'-'*col_aar}")
 
-    print(fmt.format("序号", "SO 文件", "ABI", "ELF对齐", "ZIP对齐", "来源"))
-    print(sep)
+    def _row(no, so, abi, elf, zip_, aar):
+        return (" " + _ljust(str(no), col_no)
+                + " " + _ljust(so, col_so)
+                + " " + _ljust(abi, col_abi)
+                + " " + _ljust(elf, col_elf)
+                + " " + _ljust(zip_, col_zip)
+                + " " + aar)
+
+    sep = (" " + "-"*col_no + " " + "-"*col_so + " " + "-"*col_abi
+           + " " + "-"*col_elf + " " + "-"*col_zip + " " + "-"*col_aar)
+
+    print(_dim(_row("序号", "SO 文件", "ABI", "ELF对齐", "ZIP对齐", "来源")))
+    print(_dim(sep))
 
     for i, r in enumerate(non_compliant_results, 1):
         elf_align = "-"
@@ -929,34 +993,49 @@ def print_results(results: list[SoCheckResult], apk_path: str, verbose: bool = F
             elf_align = align_str(r.elf_result.min_align)
             if r.elf_result.min_align >= ALIGN_16KB and not r.elf_result.relro_ok:
                 elf_align = f"{elf_align}/RELRO异常"
+            if r.elf_result.min_align < ALIGN_16KB:
+                elf_align = _red(elf_align)
+            else:
+                elf_align = _yellow(elf_align)
 
         if r.zip_result:
-            zip_str = "已压缩" if r.zip_result.is_compressed else ("已对齐" if r.zip_result.is_aligned else "未对齐")
+            if r.zip_result.is_compressed:
+                zip_str = _dim("已压缩")
+            elif r.zip_result.is_aligned:
+                zip_str = _green("已对齐")
+            else:
+                zip_str = _red("未对齐")
         else:
             zip_str = "-"
 
-        aar_list = [_shorten_source(a) for a in r.aar_sources] if r.aar_sources else ["未找到"]
+        aar_list = [_shorten_source(a) for a in r.aar_sources] if r.aar_sources else [_dim("未找到")]
 
+        so_name_colored = _yellow(r.so_name)
         # 第一行：序号 + 所有字段 + AAR 第一条
-        print(fmt.format(i, r.so_name, r.abi, elf_align, zip_str, aar_list[0]))
+        print(_row(i, so_name_colored, r.abi, elf_align, zip_str, aar_list[0]))
         # AAR 额外条目另起一行
         for extra in aar_list[1:]:
-            print(fmt.format("", "", "", "", "", extra))
+            print(_row("", "", "", "", "", extra))
 
         # verbose: 路径 + 每个 LOAD 段详情
         if verbose:
-            print(f"      路径: {r.path_in_apk}")
+            print(f"      {_dim('路径:')} {r.path_in_apk}")
             if r.elf_result and r.elf_result.load_segments:
                 for j, seg in enumerate(r.elf_result.load_segments):
-                    tag = "  OK" if seg.align >= ALIGN_16KB else "  !!"
+                    if seg.align >= ALIGN_16KB:
+                        tag = _green("  OK")
+                        align_display = _green(f"{align_str(seg.align)} (0x{seg.align:X})")
+                    else:
+                        tag = _red("  !!")
+                        align_display = _red(f"{align_str(seg.align)} (0x{seg.align:X})")
                     print(f"      LOAD[{j}]  offset=0x{seg.offset:08X}  vaddr=0x{seg.vaddr:08X}"
-                          f"  filesz=0x{seg.filesz:08X}  align={align_str(seg.align)} (0x{seg.align:X}){tag}")
+                          f"  filesz=0x{seg.filesz:08X}  align={align_display}{tag}")
             if r.elf_result and not r.elf_result.relro_ok:
-                print(f"      RELRO: {r.elf_result.relro_issue}  !!")
+                print(f"      {_yellow('RELRO:')} {r.elf_result.relro_issue}  {_red('!!')}")
 
     print(f"\n {'─' * (W - 2)}")
-    print(f" 结论: {non_compliant}/{total} 个共享库需要使用 16KB 对齐方式重新编译。")
-    print(f" 参考: https://developer.android.com/guide/practices/page-sizes")
+    print(f" 结论: " + _red(f"{non_compliant}/{total}") + " 个共享库需要使用 16KB 对齐方式重新编译。")
+    print(f" 参考: {_dim('https://developer.android.com/guide/practices/page-sizes')}")
     print()
 
 
