@@ -59,11 +59,11 @@ python3 apk_16kb_checker.py app.apk --no-source-search
 
  序号   SO 文件                              ABI           ELF对齐    ZIP对齐       来源
  ---- ---------------------------------- ------------- -------- ----------- ---------------------------------------------
- 1    libgifimage.so                     arm64-v8a     4KB      已压缩         com.facebook.fresco:animated-gif:3.4.0
- 2    libimagepipeline.so                arm64-v8a     4KB      已压缩         com.facebook.fresco:imagepipeline:3.4.0
-                                                                            com.facebook.fresco:imagepipeline-native:3.4.0
- 3    libnative-filters.so               arm64-v8a     4KB      已压缩         com.facebook.fresco:nativeimagefilters:3.4.0
- 4    libnative-imagetranscoder.so       arm64-v8a     4KB      已压缩         com.facebook.fresco:nativeimagetranscoder:3.4.0
+ 1    libgifimage.so                     arm64-v8a     4KB      已压缩         com.facebook.fresco:animated-gif:2.5.0
+ 2    libimagepipeline.so                arm64-v8a     4KB      已压缩         com.facebook.fresco:imagepipeline:2.5.0
+                                                                            com.facebook.fresco:imagepipeline-native:2.5.0
+ 3    libnative-filters.so               arm64-v8a     4KB      已压缩         com.facebook.fresco:nativeimagefilters:2.5.0
+ 4    libnative-imagetranscoder.so       arm64-v8a     4KB      已压缩         com.facebook.fresco:nativeimagetranscoder:2.5.0
  5    libsecsdk.so                       x86_64        4KB      已压缩         System.loadLibrary 引用
  ...
 
@@ -73,7 +73,7 @@ python3 apk_16kb_checker.py app.apk --no-source-search
 ```
 
 来源列说明：
-- **精确 Maven 坐标**（如 `com.facebook.fresco:imagepipeline:3.4.0`）：从本地 Gradle/Maven 缓存中反推，或从 APK 内 META-INF 版本文件精确匹配
+- **精确 Maven 坐标**（如 `com.facebook.fresco:imagepipeline:2.5.0`）：从本地 Gradle/Maven 缓存中反推，或从 APK 内 META-INF 版本文件精确匹配
 - **推测坐标**（如 `com.facebook:imagepipeline (推测)`）：无 Gradle 缓存时，从 DEX 字符串池中的 Java 包名推测的 Maven 坐标
 - **System.loadLibrary 引用**：在 DEX 中发现了 `System.loadLibrary()` 调用，但无法识别具体依赖
 - **未找到**：未能找到相关线索
@@ -83,7 +83,7 @@ python3 apk_16kb_checker.py app.apk --no-source-search
 在默认输出基础上，每条不合规记录额外展示 APK 内路径和所有 ELF PT_LOAD 段详情：
 
 ```
- 1    libgifimage.so                     arm64-v8a     4KB      已压缩         com.facebook.fresco:animated-gif:3.4.0
+ 1    libgifimage.so                     arm64-v8a     4KB      已压缩         com.facebook.fresco:animated-gif:2.5.0
       路径: lib/arm64-v8a/libgifimage.so
       LOAD[0]  offset=0x00000000  vaddr=0x00000000  filesz=0x00038D3C  align=4KB (0x1000)  !!
       LOAD[1]  offset=0x000399D0  vaddr=0x0003A9D0  filesz=0x000038B0  align=4KB (0x1000)  !!
@@ -113,7 +113,7 @@ python3 apk_16kb_checker.py app.apk --no-source-search
         ]
       },
       "zip": {"is_compressed": true, "data_offset": 1234, "is_aligned": false},
-      "sources": ["com.facebook.fresco:animated-gif:3.4.0"]
+      "sources": ["com.facebook.fresco:animated-gif:2.5.0"]
     }
   ]
 }
